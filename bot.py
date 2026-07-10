@@ -25,6 +25,13 @@ TEMP_DIR.mkdir(exist_ok=True)
 # User session data
 user_data = {}
 
+# Video file extensions to accept
+VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg', '.3gp')
+
+def is_video_file(file_name):
+    """Check if file is a video based on extension."""
+    return any(file_name.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send welcome message with options."""
     keyboard = [
@@ -53,7 +60,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if query.data == "uniquify":
         await query.edit_message_text(
             "📤 *Please send me a video file*\n\n"
-            "Supported formats: MP4, AVI, MOV, MKV\n"
+            "Supported formats: MP4, AVI, MOV, MKV, and more\n"
             "Max size: 50MB",
             parse_mode="Markdown"
         )
@@ -75,7 +82,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "settings":
         keyboard = [
             [InlineKeyboardButton("🔄 Mirror Mode", callback_data="toggle_mirror")],
-            [InlineKeyboardButton("📊 Quality", callback_data="quality")],
             [InlineKeyboardButton("🔙 Back", callback_data="back")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -100,19 +106,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "back":
         await start(update, context)
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process incoming videos."""
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle document files (videos sent as files)."""
     user_id = update.effective_user.id
+    document = update.message.document
+    
+    if not document:
+        await update.message.reply_text("❌ Please send a video file.")
+        return
+    
+    # Check if it's a video file
+    if not is_video_file(document.file_name):
+        await update.message.reply_text(
+            "❌ Please send a *video file*.\n\n"
+            f"Supported formats: {', '.join(VIDEO_EXTENSIONS).replace('.', '')}\n"
+            "Max size: 50MB",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Check file size
+    if document.file_size > 50 * 1024 * 1024:
+        await update.message.reply_text("❌ Video too large! Maximum 50MB.")
+        return
+    
+    # Process the video
+    await process_video(update, context, document.file_id, document.file_name, is_document=True)
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle video messages."""
     video = update.message.video
     
     if not video:
         await update.message.reply_text("❌ Please send a video file.")
         return
     
-    # Check file size (50MB limit)
+    # Check file size
     if video.file_size > 50 * 1024 * 1024:
         await update.message.reply_text("❌ Video too large! Maximum 50MB.")
         return
+    
+    # Process the video
+    await process_video(update, context, video.file_id, "video.mp4", is_document=False)
+
+async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, file_name: str, is_document: bool) -> None:
+    """Process video with FFmpeg."""
+    user_id = update.effective_user.id
     
     # Send processing message
     processing_msg = await update.message.reply_text(
@@ -122,14 +161,21 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     
     try:
-        # Download video
-        file = await context.bot.get_file(video.file_id)
+        # Get file
+        file = await context.bot.get_file(file_id)
         unique_id = str(uuid.uuid4())[:8]
-        input_path = TEMP_DIR / f"input_{unique_id}.mp4"
+        
+        # Determine input path with correct extension
+        if is_document and file_name:
+            ext = Path(file_name).suffix or '.mp4'
+        else:
+            ext = '.mp4'
+        
+        input_path = TEMP_DIR / f"input_{unique_id}{ext}"
         output_path = TEMP_DIR / f"output_{unique_id}.mp4"
         
         await file.download_to_drive(input_path)
-        logger.info(f"Downloaded video for user {user_id}")
+        logger.info(f"Downloaded video for user {user_id} from {file_name}")
         
         # Get user settings
         mirror = user_data.get(user_id, {}).get("mirror", False)
@@ -138,17 +184,17 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         cmd = [
             "ffmpeg",
             "-i", str(input_path),
-            "-b:v", "2M",  # Change bitrate
+            "-b:v", "2M",
             "-maxrate", "2M",
             "-bufsize", "4M",
-            "-map_metadata", "-1",  # Remove metadata
+            "-map_metadata", "-1",
         ]
         
         if mirror:
             cmd.extend(["-vf", "hflip"])
         
         cmd.append(str(output_path))
-        cmd.append("-y")  # Overwrite output
+        cmd.append("-y")
         
         # Run FFmpeg
         result = subprocess.run(
@@ -210,6 +256,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_error_handler(error_handler)
     
     # Start bot
